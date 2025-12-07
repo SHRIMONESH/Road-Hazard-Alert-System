@@ -1,0 +1,33 @@
+name: Ingestion Workflow
+
+on:
+  schedule:
+    # Runs every 5 minutes
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ingest-data:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run ingestion script
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          MAPILLARY_API_KEY: ${{ secrets.MAPILLARY_API_KEY }}
+          OVERPASS_API_URL: ${{ secrets.OVERPASS_API_URL }}
+          CLUSTER_EPS_METERS: ${{ secrets.CLUSTER_EPS_METERS }}
+          CLUSTER_MIN_SAMPLES: ${{ secrets.CLUSTER_MIN_SAMPLES }}
+        run: npx ts-node --project tsconfig.worker.json worker/ingestion.ts

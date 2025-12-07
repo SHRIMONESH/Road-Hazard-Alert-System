@@ -1,0 +1,10 @@
+﻿$env:SUPABASE_URL="https://csydsnyvfhpzkigzfeov.supabase.co"
+$env:SUPABASE_ANON_KEY="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNzeWRzbnl2ZmhwemtpZ3pmZW92Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjM0NDY1ODQsImV4cCI6MjA3OTAyMjU4NH0.A8YUnFvs7peSOz0DY4dTsqURfz0rsSbZ8X3uQmqM254"
+$env:SUPABASE_SERVICE_ROLE_KEY="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNzeWRzbnl2ZmhwemtpZ3pmZW92Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2MzQ0NjU4NCwiZXhwIjoyMDc5MDIyNTg0fQ.Yw1bfBvN3gd51NSGjLyFh0hq3l_rdMYXcgzM5MkrcTY"
+$env:MAPILLARY_API_KEY="MLY|25159300030394887|cb0def9140bff67bcccfd3d323127cfa"
+$env:OVERPASS_API_URL="https://overpass-api.de/api/interpreter"
+$env:CLUSTER_EPS_METERS="15"
+$env:CLUSTER_MIN_SAMPLES="2"
+
+npm run worker:build
+node dist/ingestion.js

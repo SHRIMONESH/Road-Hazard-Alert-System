@@ -1,0 +1,571 @@
+// Import dotenv and configure it to load .env.local
+import dotenv from 'dotenv';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+// Load .env.local from project root (one level up from dist/)
+dotenv.config({ path: join(__dirname, '..', '.env.local') });
+
+// Import dependencies
+import { createClient } from '@supabase/supabase-js'
+import * as turf from '@turf/turf'
+import { LineString } from 'geojson'; 
+
+// --- Configuration ---
+const CONFIG = {
+    CLUSTER_EPS_METERS: parseFloat(process.env.CLUSTER_EPS_METERS || '15'),
+    CLUSTER_MIN_SAMPLES: parseInt(process.env.CLUSTER_MIN_SAMPLES || '2'),
+    
+    // Retry configuration
+    MAPILLARY_MAX_RETRIES: 5,
+    MAPILLARY_BASE_DELAY: 2000, // Start with 2 seconds
+    MAPILLARY_MAX_DELAY: 60000, // Cap at 60 seconds
+    MAPILLARY_TIMEOUT: 120000, // 2 minutes per request
+    
+    OSM_MAX_RETRIES: 3,
+    OSM_BASE_DELAY: 10000,
+    OSM_TIMEOUT: 90000,
+    
+    // Batch sizes
+    OSM_BATCH_SIZE: 500,
+    MAPILLARY_BATCH_SIZE: 500,
+    MAPILLARY_PAGE_LIMIT: 2000, // Maximum images per page
+    
+    // Chennai bounding box
+    CHENNAI_BBOX: {
+        lat_min: 13.0350,
+        lon_min: 80.2250,
+        lat_max: 13.0650,
+        lon_max: 80.2550,
+    },
+};
+
+// --- Verification & Initialization ---
+console.log('Environment check:');
+console.log('SUPABASE_URL:', process.env.SUPABASE_URL ? '✓ Loaded' : '✗ MISSING');
+console.log('SUPABASE_SERVICE_ROLE_KEY:', process.env.SUPABASE_SERVICE_ROLE_KEY ? '✓ Loaded' : '✗ MISSING');
+console.log('MAPILLARY_API_KEY:', process.env.MAPILLARY_API_KEY ? '✓ Loaded' : '✗ MISSING');
+console.log('OVERPASS_API_URL:', process.env.OVERPASS_API_URL ? '✓ Loaded' : '✗ MISSING');
+
+// Validate environment variables
+const requiredEnvVars = [
+    'SUPABASE_URL',
+    'SUPABASE_SERVICE_ROLE_KEY',
+    'MAPILLARY_API_KEY',
+    'OVERPASS_API_URL'
+];
+
+const missingEnvVars = requiredEnvVars.filter(varName => !process.env[varName]);
+
+if (missingEnvVars.length > 0) {
+    console.error('\n❌ ERROR: Missing required environment variables:');
+    missingEnvVars.forEach(varName => console.error(`  - ${varName}`));
+    console.error('\nPlease ensure your .env.local file exists and contains all required variables.');
+    process.exit(1);
+}
+
+const supabaseUrl = process.env.SUPABASE_URL!;
+const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+const mapillaryApiKey = process.env.MAPILLARY_API_KEY!;
+const overpassApiUrl = process.env.OVERPASS_API_URL!;
+
+console.log('\n✓ All environment variables loaded successfully\n');
+
+// Initialize Supabase Client
+const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
+
+// --- Enhanced Fetch with Exponential Backoff ---
+interface FetchOptions {
+    url: string;
+    options?: RequestInit;
+    timeout?: number;
+    maxRetries?: number;
+    baseDelay?: number;
+    maxDelay?: number;
+    onRetry?: (attempt: number, error: Error, delay: number) => void;
+}
+
+async function fetchWithExponentialBackoff({
+    url,
+    options = {},
+    timeout = 120000,
+    maxRetries = 3,
+    baseDelay = 1000,
+    maxDelay = 60000,
+    onRetry,
+}: FetchOptions): Promise<Response> {
+    let lastError: Error | undefined;
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), timeout);
+        
+        try {
+            const response = await fetch(url, {
+                ...options,
+                signal: controller.signal,
+            });
+            clearTimeout(timeoutId);
+            
+            // Handle rate limiting with exponential backoff
+            if (response.status === 429) {
+                const retryAfter = response.headers.get('Retry-After');
+                const delay = retryAfter 
+                    ? parseInt(retryAfter) * 1000 
+                    : Math.min(baseDelay * Math.pow(2, attempt - 1), maxDelay);
+                
+                const error = new Error(`Rate limited (429). Retry after ${delay}ms`);
+                lastError = error;
+                
+                if (attempt < maxRetries) {
+                    onRetry?.(attempt, error, delay);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                    continue;
+                }
+                throw error;
+            }
+            
+            // Handle server errors (5xx) with backoff
+            if (response.status >= 500) {
+                const delay = Math.min(baseDelay * Math.pow(2, attempt - 1), maxDelay);
+                const error = new Error(`Server error (${response.status}): ${response.statusText}`);
+                lastError = error;
+                
+                if (attempt < maxRetries) {
+                    onRetry?.(attempt, error, delay);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                    continue;
+                }
+                throw error;
+            }
+            
+            // Handle client errors (4xx) - don't retry
+            if (response.status >= 400) {
+                throw new Error(`Client error (${response.status}): ${response.statusText}`);
+            }
+            
+            return response;
+            
+        } catch (error) {
+            clearTimeout(timeoutId);
+            lastError = error as Error;
+            
+            // Don't retry on abort/timeout for last attempt
+            if (attempt >= maxRetries) {
+                throw lastError;
+            }
+            
+            // Calculate exponential backoff delay
+            const delay = Math.min(baseDelay * Math.pow(2, attempt - 1), maxDelay);
+            onRetry?.(attempt, lastError, delay);
+            await new Promise(resolve => setTimeout(resolve, delay));
+        }
+    }
+    
+    throw lastError || new Error('All fetch attempts failed');
+}
+
+// --- OSM Data Fetching ---
+async function fetchAndStoreOSMWays(bbox: string): Promise<boolean> {
+    console.log('📍 Fetching OSM ways for Chennai, India...');
+    
+    const overpassQuery = `
+        [out:json][timeout:90];
+        (
+            way["highway"~"^(motorway|trunk|primary|secondary|tertiary|residential|service)$"](${bbox});
+        );
+        out geom;
+    `;
+
+    try {
+        const response = await fetchWithExponentialBackoff({
+            url: overpassApiUrl,
+            options: {
+                method: 'POST',
+                headers: { 'Content-Type': 'text/plain' },
+                body: overpassQuery,
+            },
+            timeout: CONFIG.OSM_TIMEOUT,
+            maxRetries: CONFIG.OSM_MAX_RETRIES,
+            baseDelay: CONFIG.OSM_BASE_DELAY,
+            onRetry: (attempt, error, delay) => {
+                console.log(`   ⚠️  OSM attempt ${attempt} failed: ${error.message}`);
+                console.log(`   ⏳ Retrying in ${delay}ms...`);
+            },
+        });
+
+        const osmData = await response.json();
+        const ways = osmData.elements.filter((e: any) => e.type === 'way');
+
+        if (ways.length === 0) {
+            console.log('   ⚠️  No OSM ways found in area.');
+            return false;
+        }
+
+        console.log(`   ✓ Found ${ways.length} OSM ways`);
+
+        const recordsToInsert = ways
+            .map((way: any) => {
+                if (!way.geometry || way.geometry.length < 2) {
+                    return null;
+                }
+                
+                const tags = way.tags || {};
+                return {
+                    way_id: way.id,
+                    geom: turf.lineString(way.geometry.map((g: any) => [g.lon, g.lat])).geometry,
+                    highway: tags.highway || 'unknown',
+                    tags_json: tags,
+                };
+            })
+            .filter((r: any): r is NonNullable<typeof r> => r !== null);
+
+        if (recordsToInsert.length === 0) {
+            console.log('   ⚠️  No valid OSM ways to insert.');
+            return false;
+        }
+
+        // Insert in batches
+        for (let i = 0; i < recordsToInsert.length; i += CONFIG.OSM_BATCH_SIZE) {
+            const batch = recordsToInsert.slice(i, i + CONFIG.OSM_BATCH_SIZE);
+            const { error } = await supabase.from('osm_ways').upsert(batch);
+
+            if (error) {
+                console.error(`   ❌ Error inserting batch ${Math.floor(i / CONFIG.OSM_BATCH_SIZE) + 1}:`, error);
+                return false;
+            }
+        }
+
+        console.log(`   ✓ Inserted ${recordsToInsert.length} OSM ways\n`);
+        return true;
+
+    } catch (error: any) {
+        console.error('   ❌ Failed to fetch OSM data:', error.message);
+        console.log('   💡 Consider using a smaller bounding box or trying later\n');
+        return false;
+    }
+}
+
+// --- Mapillary Data Fetching with Pagination ---
+async function fetchMapillaryImages(
+    bbox: string,
+    startDate: string,
+    limit: number = CONFIG.MAPILLARY_PAGE_LIMIT
+): Promise<any[]> {
+    const allImages: any[] = [];
+    let nextUrl: string | null = null;
+    let page = 1;
+    
+    const baseUrl = `https://graph.mapillary.com/images?fields=id,geometry,computed_geometry,captured_at,compass_angle,is_pano,sequence,thumb_256_url,thumb_1024_url,detections.data&bbox=${bbox}&start_captured_at=${startDate}&limit=${limit}&access_token=${mapillaryApiKey}`;
+    
+    nextUrl = baseUrl;
+    
+    while (nextUrl) {
+        console.log(`   📄 Fetching page ${page}...`);
+        
+        try {
+            const response = await fetchWithExponentialBackoff({
+                url: nextUrl,
+                timeout: CONFIG.MAPILLARY_TIMEOUT,
+                maxRetries: CONFIG.MAPILLARY_MAX_RETRIES,
+                baseDelay: CONFIG.MAPILLARY_BASE_DELAY,
+                maxDelay: CONFIG.MAPILLARY_MAX_DELAY,
+                onRetry: (attempt, error, delay) => {
+                    console.log(`   ⚠️  Mapillary page ${page}, attempt ${attempt} failed: ${error.message}`);
+                    console.log(`   ⏳ Retrying in ${Math.round(delay / 1000)}s...`);
+                },
+            });
+            
+            const data = await response.json();
+            
+            if (data.data && Array.isArray(data.data)) {
+                allImages.push(...data.data);
+                console.log(`   ✓ Page ${page}: ${data.data.length} images (Total: ${allImages.length})`);
+            }
+            
+            // Check for next page
+            nextUrl = data.paging?.next || null;
+            page++;
+            
+            // Add small delay between pages to avoid rate limiting
+            if (nextUrl) {
+                await new Promise(resolve => setTimeout(resolve, 1000));
+            }
+            
+        } catch (error: any) {
+            console.error(`   ❌ Failed to fetch page ${page}:`, error.message);
+            
+            // If we have some data, continue with what we got
+            if (allImages.length > 0) {
+                console.log(`   ⚠️  Continuing with ${allImages.length} images collected so far`);
+                break;
+            }
+            
+            throw error;
+        }
+    }
+    
+    return allImages;
+}
+
+// --- Extract Detections from Multiple Formats ---
+function extractDetections(img: any): any[] {
+    // Try multiple detection formats
+    if (Array.isArray(img.detections)) {
+        return img.detections;
+    }
+    
+    if (img.detections?.data && Array.isArray(img.detections.data)) {
+        return img.detections.data;
+    }
+    
+    if (img.detections?.values && Array.isArray(img.detections.values)) {
+        return img.detections.values;
+    }
+    
+    return [];
+}
+
+// --- Process and Store Detections ---
+async function processAndStoreDetections(images: any[]): Promise<boolean> {
+    console.log('\n💾 Processing detection data...');
+    
+    const recordsToInsert: any[] = [];
+    let totalDetections = 0;
+    let imagesWithDetections = 0;
+    const detectionTypes = new Set<string>();
+
+    for (const img of images) {
+        const capturedAt = typeof img.captured_at === 'number'
+            ? new Date(img.captured_at).toISOString()
+            : img.captured_at;
+
+        const detectionsArray = extractDetections(img);
+
+        if (detectionsArray.length === 0) {
+            continue;
+        }
+
+        imagesWithDetections++;
+
+        for (const detection of detectionsArray) {
+            if (!detection || !detection.value) {
+                continue;
+            }
+
+            totalDetections++;
+            detectionTypes.add(detection.value);
+
+            const confidence = detection.score ?? detection.confidence ?? null;
+
+            recordsToInsert.push({
+                image_id: img.id,
+                lat: img.geometry.coordinates[1],
+                lon: img.geometry.coordinates[0],
+                geom: `POINT(${img.geometry.coordinates[0]} ${img.geometry.coordinates[1]})`,
+                captured_at: capturedAt,
+                feature_class: detection.value,
+                confidence: confidence,
+                image_url: img.thumb_256_url,
+            });
+        }
+    }
+
+    console.log(`   📊 Summary:`);
+    console.log(`      - Images processed: ${images.length}`);
+    console.log(`      - Images with detections: ${imagesWithDetections}`);
+    console.log(`      - Total detections: ${totalDetections}`);
+    console.log(`      - Unique types: ${detectionTypes.size}`);
+
+    if (recordsToInsert.length === 0) {
+        console.log('\n   ⚠️  No detections to store');
+        return false;
+    }
+
+    console.log('\n   📝 Detection breakdown:');
+    Array.from(detectionTypes).sort().forEach(type => {
+        const count = recordsToInsert.filter(r => r.feature_class === type).length;
+        console.log(`      - ${type}: ${count}`);
+    });
+
+    // Insert in batches
+    console.log('\n   💾 Inserting into database...');
+    for (let i = 0; i < recordsToInsert.length; i += CONFIG.MAPILLARY_BATCH_SIZE) {
+        const batch = recordsToInsert.slice(i, i + CONFIG.MAPILLARY_BATCH_SIZE);
+        const batchNum = Math.floor(i / CONFIG.MAPILLARY_BATCH_SIZE) + 1;
+        
+        const { error } = await supabase
+            .from('mapillary_detections')
+            .upsert(batch);
+
+        if (error) {
+            console.error(`   ❌ Error inserting batch ${batchNum}:`, error);
+            return false;
+        }
+        
+        console.log(`   ✓ Batch ${batchNum}: ${batch.length} detections`);
+    }
+
+    console.log(`\n   ✓ Successfully stored ${recordsToInsert.length} detections\n`);
+    return true;
+}
+
+// --- Clustering ---
+async function clusterDetections(): Promise<boolean> {
+    console.log('🔍 Clustering detections...');
+    console.log(`   Parameters: ${CONFIG.CLUSTER_EPS_METERS}m radius, min ${CONFIG.CLUSTER_MIN_SAMPLES} points`);
+    
+    try {
+        const { error } = await supabase.rpc('cluster_recent_detections', {
+            eps_meters: CONFIG.CLUSTER_EPS_METERS,
+            min_points: CONFIG.CLUSTER_MIN_SAMPLES,
+        });
+
+        if (error) {
+            console.error('   ❌ Clustering error:', error);
+            return false;
+        }
+
+        console.log('   ✓ Clustering completed\n');
+        return true;
+        
+    } catch (error: any) {
+        console.error('   ❌ Clustering failed:', error.message);
+        return false;
+    }
+}
+
+// --- Update Ingestion State ---
+async function updateIngestionState(): Promise<void> {
+    const { error } = await supabase
+        .from('ingestion_state')
+        .upsert(
+            { id: 1, last_run_at: new Date().toISOString() }, 
+            { onConflict: 'id' }
+        );
+
+    if (error) {
+        console.error('   ⚠️  Could not update ingestion state:', error);
+    }
+}
+
+// --- Main Ingestion Function ---
+async function runIngestion() {
+    console.log('═══════════════════════════════════════════════');
+    console.log('  Chennai Road Hazard Detection - Ingestion');
+    console.log('═══════════════════════════════════════════════\n');
+
+    let osmSuccess = false;
+    let mapillarySuccess = false;
+    let clusterSuccess = false;
+
+    try {
+        // Get last run time
+        const { data: state, error: stateError } = await supabase
+            .from('ingestion_state')
+            .select('last_run_at')
+            .eq('id', 1)
+            .single();
+
+        if (stateError && stateError.code !== 'PGRST116') {
+            console.error('⚠️  Error fetching last run time:', stateError);
+        }
+
+        // FORCE BACKFILL MODE - Set to date for historical data
+        const FORCE_START_DATE = '2024-01-01T00:00:00Z';
+
+        let lastRunAt: string;
+        
+        if (FORCE_START_DATE) {
+            console.log(`⚠️  MODE: FORCED BACKFILL`);
+            console.log(`   Start date: ${FORCE_START_DATE}\n`);
+            lastRunAt = FORCE_START_DATE;
+        } else {
+            const sixMonthsAgo = new Date();
+            sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+            lastRunAt = state?.last_run_at || sixMonthsAgo.toISOString();
+            console.log(`📅 Incremental mode since: ${lastRunAt}\n`);
+        }
+
+        const normalizedLastRunAt = new Date(lastRunAt).toISOString().replace(/\.\d{3}Z$/, 'Z');
+        
+        const bbox = `${CONFIG.CHENNAI_BBOX.lat_min},${CONFIG.CHENNAI_BBOX.lon_min},${CONFIG.CHENNAI_BBOX.lat_max},${CONFIG.CHENNAI_BBOX.lon_max}`;
+        
+        console.log('📍 Target: Chennai (T. Nagar), Tamil Nadu, India');
+        console.log(`   Bbox: ${bbox}`);
+        console.log(`   Area: ~3km × 3km\n`);
+
+        // Step 1: Fetch OSM data
+        console.log('═══ STEP 1: OpenStreetMap Data ═══');
+        osmSuccess = await fetchAndStoreOSMWays(bbox);
+
+        // Step 2: Fetch Mapillary data
+        console.log('═══ STEP 2: Mapillary Imagery ═══');
+        const mapillaryBbox = `${CONFIG.CHENNAI_BBOX.lon_min},${CONFIG.CHENNAI_BBOX.lat_min},${CONFIG.CHENNAI_BBOX.lon_max},${CONFIG.CHENNAI_BBOX.lat_max}`;
+        
+        try {
+            console.log('   📍 Bbox:', mapillaryBbox);
+            console.log('   📅 Since:', normalizedLastRunAt);
+            console.log('   ⏳ Fetching with pagination...\n');
+            
+            const images = await fetchMapillaryImages(mapillaryBbox, normalizedLastRunAt);
+            
+            if (images.length === 0) {
+                console.log('   ℹ️  No new images found');
+                console.log('   💡 This area may have limited coverage\n');
+                mapillarySuccess = true; // Not an error, just no data
+            } else {
+                console.log(`\n   ✓ Retrieved ${images.length} total images\n`);
+                mapillarySuccess = await processAndStoreDetections(images);
+            }
+            
+        } catch (error: any) {
+            console.error('   ❌ Mapillary fetch failed:', error.message);
+            mapillarySuccess = false;
+        }
+
+        // Step 3: Cluster detections (only if we have new data)
+        if (mapillarySuccess) {
+            console.log('═══ STEP 3: Clustering ═══');
+            clusterSuccess = await clusterDetections();
+        }
+
+        // Update state
+        if (!FORCE_START_DATE) {
+            await updateIngestionState();
+        }
+
+        // Final summary
+        console.log('═══════════════════════════════════════════════');
+        console.log('📊 INGESTION SUMMARY');
+        console.log('═══════════════════════════════════════════════');
+        console.log(`   OSM Data:         ${osmSuccess ? '✓ Success' : '✗ Failed'}`);
+        console.log(`   Mapillary Data:   ${mapillarySuccess ? '✓ Success' : '✗ Failed'}`);
+        console.log(`   Clustering:       ${clusterSuccess ? '✓ Success' : mapillarySuccess ? '✗ Failed' : '○ Skipped'}`);
+        console.log('═══════════════════════════════════════════════');
+        
+        const overallSuccess = osmSuccess || mapillarySuccess;
+        if (overallSuccess) {
+            console.log('✓ Ingestion completed with partial or full success\n');
+            process.exit(0);
+        } else {
+            console.log('⚠️  Ingestion completed with failures\n');
+            process.exit(1);
+        }
+
+    } catch (error: any) {
+        console.error('═══════════════════════════════════════════════');
+        console.error('💥 FATAL ERROR');
+        console.error('═══════════════════════════════════════════════');
+        console.error('Message:', error.message);
+        console.error('Stack:', error.stack);
+        console.error('═══════════════════════════════════════════════\n');
+        process.exit(1);
+    }
+}
+
+// Run the function
+runIngestion();
